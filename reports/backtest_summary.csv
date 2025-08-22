@@ -1,0 +1,4 @@
+Symbol,Model,Accuracy,Return(%),Sharpe,MaxDD(%)
+GBPUSD,XGBClassifier,0.994,27.13,6.053,-2.24
+EURUSD,LGBMClassifier,0.969,8.26,3.754,-1.4
+AUDUSD,BernoulliNB,0.894,0.14,0.081,-8.01

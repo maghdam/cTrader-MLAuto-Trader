@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints
+
+# Env / secrets
+.env
+notes.txt
+# Data & runtime artifacts
+logs/
+live_signals.db
+
+# Models (choose ONE approach: ignore OR track via LFS)
+models/**/*
+!models/.gitkeep
+
+# Docker cruft
+*.log

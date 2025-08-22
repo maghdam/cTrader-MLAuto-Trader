@@ -1,0 +1,58 @@
+services:
+  trader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ml-dbarrier:latest
+    container_name: dbarrier-trader
+    restart: unless-stopped
+    init: true
+
+    # Load credentials & strategy params from .env
+    env_file: [.env]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"     # parent of `src` so `from src...` works
+      TZ: Europe/Zurich           # system tz for processes
+      LOCAL_TZ: Europe/Zurich     # what our code uses to format logs
+
+    volumes:
+      - ./models/h1_models:/app/models/h1_models:ro
+      - ./logs:/app/logs
+      - ./live_signals.db:/app/live_signals.db   # ensure file exists: `touch live_signals.db`
+      - ./src:/app/src
+
+    working_dir: /app
+    entrypoint: ["python", "-u", "src/live_trader.py"]
+
+    healthcheck:
+      # Healthy once log exists & has content, or contains one of these markers
+      test: ["CMD-SHELL", "test -s /app/logs/live_trader.log || grep -q 'cTrader ready' /app/logs/live_trader.log || grep -q 'Live loop started' /app/logs/live_trader.log"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  # On-demand Optuna tuning job
+  optimize:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ml-dbarrier:latest
+    container_name: dbarrier-optimize
+    profiles: ["ops"]
+    restart: "no"
+    init: true
+
+    env_file: [.env]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"
+
+    volumes:
+      - ./models/h1_models:/app/models/h1_models
+      - ./logs:/app/logs
+      - ./src:/app/src
+
+    working_dir: /app
+    entrypoint: ["python", "-u", "src/optimize_models.py"]
