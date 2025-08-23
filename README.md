@@ -212,7 +212,7 @@ This builds a `vbt.Portfolio` (long/short), prints summary stats, and can render
 | `DEFAULT_LOTS` / `LOTS_JSON` | Sizing; prefer `LOTS_JSON` for per-symbol + default |
 | `SL_PIPS` / `TP_PIPS`        | Integer pip distances (blank disables)              |
 
-**NEW – News Gate**
+**News Gate**
 
 | Variable                | Description                                                               |
 | ----------------------- | ------------------------------------------------------------------------- |
