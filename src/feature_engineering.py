@@ -112,6 +112,36 @@ def rolling_adf_with_flag(df: pd.DataFrame, col: str = "close", window_size: int
     out["stationary_flag"]  = flag
     return out
 
+
+# --- Session features ---
+
+
+SESSION_TZ = "Europe/Zurich"  # change if you prefer
+
+def _session_from_hour(h: int) -> str:
+    # Simple, effective splits. Tweak if you like.
+    if 0 <= h < 7:   return "Asia"
+    if 7 <= h < 12:  return "London"
+    if 12 <= h < 17: return "NewYork"
+    return "PostNY"
+
+def add_session_features(df: pd.DataFrame, tz: str = SESSION_TZ) -> pd.DataFrame:
+    # Ensure UTC index, then convert to local tz for sessions
+    idx = pd.to_datetime(df.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    hours = idx.tz_convert(tz).hour
+
+    # Cyclical hour-of-day
+    df["hour_sin"] = np.sin(2 * np.pi * hours / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * hours / 24.0)
+
+    # One-hot sessions
+    sess = pd.Series([_session_from_hour(h) for h in hours], index=df.index, name="session")
+    dummies = pd.get_dummies(sess, prefix="sess")
+    return df.join(dummies)
+
+
 # --------------------------------------------------------------------
 # 6) CORE FEATURE SET (used by both notebook & live)
 # --------------------------------------------------------------------
@@ -152,11 +182,15 @@ def add_core_features(df: pd.DataFrame) -> pd.DataFrame:
     # Stationarity
     out = rolling_adf_with_flag(out, col="close", window_size=50)
 
+    # Session features
+    out = add_session_features(out) 
+
     return out.dropna()
 
 def get_core_feature_cols() -> list[str]:
     return [
         "sma_20","ema_20","kama_10","rsi_14","macd_diff",
         "atr_14","obv","rolling_std_20","spread","fill","amplitude",
-        "autocorr_1","autocorr_5","autocorr_10","market_regime","stationary_flag"
+        "autocorr_1","autocorr_5","autocorr_10","market_regime","stationary_flag",
+        "hour_sin","hour_cos","sess_Asia","sess_London","sess_NewYork","sess_PostNY",
     ]

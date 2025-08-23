@@ -13,15 +13,14 @@ from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from news_guard import news_gate  
 warnings.filterwarnings("ignore")
-
-# --- our libs (this file lives in src/, so these import siblings)
+from datetime import time as dtime  
 from feature_engineering import add_core_features
 from ctrader_client import (
     ensure_client_ready, get_ohlc_df, place_order, get_open_positions,
     symbol_name_to_id, wait_for_deferred, close_position,
     client as CTR_CLIENT, ACCOUNT_ID as CTR_ACCOUNT_ID
 )
-from notion_journal import NotionJournal, TradeEvent  # make sure src/notion_journal.py exists
+from notion_journal import NotionJournal, TradeEvent  
 
 # ---------- graceful shutdown ----------
 STOP = threading.Event()
@@ -206,6 +205,33 @@ NEWS_BLOCK_IMPACTS   = [s.strip().lower() for s in os.getenv("NEWS_BLOCK_IMPACTS
 NEWS_SKIP_IF_UPCOMING= os.getenv("NEWS_SKIP_IF_UPCOMING","0").strip() in {"1","true","yes","on"}  # optional policy
 
 
+
+# Quiet hours (optional)
+
+from datetime import time as dtime
+
+QUIET_HOURS_ENABLED = os.getenv("QUIET_HOURS_ENABLED","0").lower() in {"1","true","yes","on"}
+QUIET_START_LOCAL = os.getenv("QUIET_START_LOCAL","20:00")
+QUIET_END_LOCAL   = os.getenv("QUIET_END_LOCAL","01:00")
+
+def _parse_hhmm(s: str) -> dtime:
+    hh, mm = (s or "00:00").split(":")
+    return dtime(int(hh), int(mm))
+
+Q_START = _parse_hhmm(QUIET_START_LOCAL)
+Q_END   = _parse_hhmm(QUIET_END_LOCAL)
+
+
+
+def _in_quiet_hours(now_local: datetime, start: dtime = Q_START, end: dtime = Q_END) -> bool:
+    # Normalize to naive time to match Q_START/Q_END
+    t = now_local.time().replace(tzinfo=None)
+    if start <= end:
+        return start <= t <= end
+    # Window crosses midnight (e.g., 20:00–01:00)
+    return (t >= start) or (t <= end)
+
+
 # -------------------
 # Helpers
 # -------------------
@@ -310,24 +336,37 @@ class LiveTrader:
         df = get_ohlc_df(self.symbol, tf=TF, n=N_BARS)
         if df.empty:
             raise RuntimeError(f"{self.symbol}: no bars")
+
         df_feat = add_core_features(df.copy())
-        # choose columns
+
+        # 1) Decide desired feature set (trained cols if present, else fallback core list)
         if self.feature_cols:
-            use_cols = [c for c in self.feature_cols if c in df_feat.columns]
+            desired_cols = list(self.feature_cols)
         else:
-            core_cols = [
+            desired_cols = [
                 "sma_20","ema_20","kama_10","rsi_14","macd_diff",
                 "atr_14","obv","rolling_std_20","spread","fill","amplitude",
-                "autocorr_1","autocorr_5","autocorr_10","market_regime","stationary_flag"
+                "autocorr_1","autocorr_5","autocorr_10","market_regime","stationary_flag",
+                # session features:
+                "hour_sin","hour_cos","sess_Asia","sess_London","sess_NewYork","sess_PostNY",
             ]
-            use_cols = [c for c in core_cols if c in df_feat.columns]
 
+        # 2) Log missing features (from desired set) and use only those available
+        missing = [c for c in desired_cols if c not in df_feat.columns]
+        if missing:
+            log(f"[FE] Missing columns for {self.symbol}: {missing}")
+        use_cols = [c for c in desired_cols if c in df_feat.columns]
+
+        # 3) Build model matrix and align close
         X = df_feat[use_cols].dropna()
         close = df_feat.loc[X.index, "close"]
         if X.empty:
-            raise RuntimeError(f"{self.symbol}: no valid feature rows after FE")
+            raise RuntimeError(
+                f"{self.symbol}: no valid feature rows after FE "
+                f"(used_cols={len(use_cols)}, missing={len(missing)})"
+            )
 
-        # predict
+        # 4) Predict -> map to {-1,0,+1}
         if self.bundle["kind"] == "pipeline":
             preds_012 = self.bundle["pipeline"].predict(X)
         else:
@@ -335,8 +374,9 @@ class LiveTrader:
             preds_012 = self.bundle["model"].predict(Xs)
         preds = to_signals(preds_012)
 
-        # return last N_FORWARD signals and the aligned close series
+        # 5) Return last N_FORWARD and aligned close series
         return preds[-n_forward:], close
+
 
     # ---- position administration (simple, netting-friendly) ----
     def _open_positions_for_symbol(self):
@@ -501,6 +541,21 @@ class LiveTrader:
                         return
             else:
                 news_line = "news=n/a"
+
+
+        # --- optional quiet hours ---
+        if QUIET_HOURS_ENABLED:
+            now_local = utc_to_local(pd.Timestamp.utcnow()).to_pydatetime()
+            if _in_quiet_hours(now_local):
+                log(f"[QUIET] {self.symbol}: {now_local.strftime('%H:%M')} local within {QUIET_START_LOCAL}-{QUIET_END_LOCAL} → skip")
+                if self.journal:
+                    try:
+                        self.journal.log_trade(TradeEvent(event="QUIET_SKIP", symbol=self.symbol,
+                                                        note=f"{QUIET_START_LOCAL}-{QUIET_END_LOCAL}"))
+                    except Exception:
+                        pass
+                return
+
 
         # --- place order if not blocked ---
         sig = int(preds[0])  # {-1,0,+1}
