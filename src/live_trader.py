@@ -11,7 +11,7 @@ import pandas as pd
 import joblib
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
-
+from news_guard import news_gate  
 warnings.filterwarnings("ignore")
 
 # --- our libs (this file lives in src/, so these import siblings)
@@ -49,20 +49,31 @@ def utc_to_local(ts: pd.Timestamp) -> pd.Timestamp:
 load_dotenv()  # local runs; in Docker, compose injects env
 
 # ---- Logging (init first so log() is available)
+# ---- Logging (single logger to file + console)
 LOG_FILE = Path("logs/live_trader.log")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=getattr(logging, _LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+LOGGER = logging.getLogger("live_trader")
+# prevent duplicates if module reloaded
+if LOGGER.handlers:
+    LOGGER.handlers.clear()
+LOGGER.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
+LOGGER.propagate = False  # don't bubble to root logger
+
+fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+
+fh = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
+fh.setFormatter(fmt)
+LOGGER.addHandler(fh)
+
+sh = logging.StreamHandler()  # to Docker logs
+sh.setFormatter(fmt)
+LOGGER.addHandler(sh)
 
 def log(msg: str) -> None:
-    print(msg, flush=True)
-    logging.info(msg)
+    LOGGER.info(msg)
+
 
 # ---- Env helpers
 def _env_bool(key: str, default: bool) -> bool:
@@ -187,6 +198,14 @@ log(
     f"DEFAULT_LOTS={DEFAULT_LOTS}, LOTS={LOTS}, SL_PIPS={SL_PIPS}, TP_PIPS={TP_PIPS}"
 )
 
+# new news gate config
+
+NEWS_ENABLED         = os.getenv("NEWS_ENABLED", "1").strip() in {"1","true","yes","on"}
+NEWS_LOOKAHEAD_MIN   = int(os.getenv("NEWS_LOOKAHEAD_MIN", "120"))
+NEWS_BLOCK_IMPACTS   = [s.strip().lower() for s in os.getenv("NEWS_BLOCK_IMPACTS","extreme,high").replace(";",",").split(",") if s.strip()]
+NEWS_SKIP_IF_UPCOMING= os.getenv("NEWS_SKIP_IF_UPCOMING","0").strip() in {"1","true","yes","on"}  # optional policy
+
+
 # -------------------
 # Helpers
 # -------------------
@@ -229,6 +248,41 @@ def save_signal_to_db(symbol: str, prediction: int, timestamp: str):
 
 def most_recent_bar_time(df: pd.DataFrame) -> pd.Timestamp | None:
     return None if df.empty else pd.to_datetime(df.index[-1])
+
+
+# ---- News log formatting helper ----
+def _format_blockers(blockers: list[dict], now_iso: str) -> str:
+    """
+    Make a compact, human-friendly summary from blockers.
+    Example: "in 45m [high] USD • US CPI (YoY) | in 120m [extreme] EUR • ECB Rate Decision"
+    """
+    try:
+        now = datetime.fromisoformat(now_iso)
+    except Exception:
+        now = datetime.utcnow()
+
+    def one(b):
+        try:
+            when = datetime.fromisoformat(b["time_utc"])
+            mins = int((when - now).total_seconds() // 60)
+            rel = f"in {mins}m" if mins >= 0 else f"{-mins}m ago"
+        except Exception:
+            rel = "unknown"
+
+        impact = b.get("impact", "?")
+        ccy = b.get("currency") or []
+        if isinstance(ccy, list):
+            ccy = ",".join(ccy)
+        title = b.get("title", "").strip()
+        return f"{rel} [{impact}] {ccy or '?'} • {title}"
+
+    # Show up to 3 items, soonest first
+    try:
+        sorted_b = sorted(blockers, key=lambda x: x.get("time_utc", ""))
+    except Exception:
+        sorted_b = blockers
+    parts = [one(b) for b in sorted_b[:3]]
+    return " | ".join(parts) if parts else "none"
 
 
 # -------------------
@@ -409,17 +463,59 @@ class LiveTrader:
             future_utc = (last_ts + TF_DELTA * (i + 1))
             save_signal_to_db(self.symbol, int(p), timestamp=future_utc.isoformat())
 
-        # trade first prediction
+
+        # --- calendar gate ---
+        news_line = "news=none"
+        if NEWS_ENABLED:
+            gate = news_gate([self.symbol], lookahead_min=NEWS_LOOKAHEAD_MIN, impacts_that_block=NEWS_BLOCK_IMPACTS)
+            my = next((r for r in gate["results"] if r["symbol"] == self.symbol), None)
+            if my:
+                news_line = f"news={_format_blockers(my['blockers'], gate['now_utc'])}"
+
+                # Hard block if *currently* inside a window for a blocking impact
+                if not my["allowed_to_trade"]:
+                    log(f"[NEWS BLOCK] {self.symbol}: {news_line}")
+                    if self.journal:
+                        try:
+                            self.journal.log_trade(TradeEvent(
+                                event="NEWS_BLOCK", symbol=self.symbol, note=json.dumps(my["blockers"])[:1900]
+                            ))
+                        except Exception:
+                            pass
+                    return  # skip trading this bar
+
+                # Optional: skip if an event is upcoming (within lookahead)
+                if NEWS_SKIP_IF_UPCOMING and my["blockers"]:
+                    now_utc = datetime.fromisoformat(gate["now_utc"])
+                    upcoming = [b for b in my["blockers"] if datetime.fromisoformat(b["time_utc"]) > now_utc]
+                    if upcoming:
+                        news_line = f"news={_format_blockers(upcoming, gate['now_utc'])}"
+                        log(f"[NEWS UPCOMING] {self.symbol} (≤{NEWS_LOOKAHEAD_MIN}m): {news_line}")
+                        if self.journal:
+                            try:
+                                self.journal.log_trade(TradeEvent(
+                                    event="NEWS_UPCOMING", symbol=self.symbol, note=json.dumps(upcoming)[:1900]
+                                ))
+                            except Exception:
+                                pass
+                        return
+            else:
+                news_line = "news=n/a"
+
+        # --- place order if not blocked ---
         sig = int(preds[0])  # {-1,0,+1}
         self._ensure_direction(sig)
 
-        # log both UTC and local (Swiss) for readability
+
+
+        # log both UTC and local (Swiss) for readability — now with news summary
         bar_local = utc_to_local(last_ts)
         log(
             f"{self.symbol}: bar_utc={last_ts.isoformat()} | "
             f"bar_{LOCAL_TZ}={bar_local.strftime('%Y-%m-%d %H:%M:%S %Z')} | "
-            f"signal={sig} | preds_next={preds.tolist()}"
+            f"signal={sig} | preds_next={preds.tolist()} | news={_format_blockers(my['blockers'], gate['now_utc']) if NEWS_ENABLED and 'my' in locals() and my else 'none'}"
         )
+
 
     def _current_side(self) -> int:
         """
