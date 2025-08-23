@@ -196,6 +196,120 @@ This builds a `vbt.Portfolio` (long/short), prints summary stats, and can render
 
 ---
 
+## 🧠 Model Training, Strategies & Notebook Workflow
+
+All research, training, backtesting, and tuning are orchestrated in the notebook:
+
+```
+notebooks/backtest_training_tuning.ipynb
+```
+
+This notebook lets you:
+
+* pick **any model** or the **best model** via validation,
+* train **multiple symbols** in one run,
+* add custom **features/indicators** in `src/feature_engineering.py`,
+* switch or create a **strategy/labeling** in `src/labeling_schemes.py`
+  (default is **Double-Barrier**),
+* **backtest** and **fine-tune** (Optuna) per symbol,
+* **save** the trained pipelines to `models/<tf>_models/`,
+* then run them live by adjusting `.env` and starting the **live\_trader**.
+
+### Workflow at a glance
+
+1. **Open the notebook** `notebooks/backtest_training_tuning.ipynb`.
+2. **Choose your universe**:
+
+   ```python
+   SYMBOLS = ["EURUSD", "GBPUSD", "AUDUSD"]  # any list you like
+   TF = "H1"  # must match what you’ll use in live trading
+   N_BARS = 2500
+   ```
+3. **Select / extend features** in `src/feature_engineering.py`.
+   Add new indicators inside `add_core_features(df)`; they’ll be available to the notebook and to live trading.
+
+   ```python
+   # src/feature_engineering.py (example)
+   def add_core_features(df):
+       # existing features...
+       # df["rsi_14"] = <your RSI calc>
+       # df["my_feature"] = <your custom feature>
+       return df
+   ```
+4. **Pick a labeling strategy** in `src/labeling_schemes.py`.
+   Default is **Double-Barrier** (0=down, 1=flat, 2=up). You can tweak barrier sizes/holding periods or add brand-new strategies and select them in the notebook.
+
+   ```python
+   # in the notebook
+   from labeling_schemes import label_double_barrier  # or your custom
+   labels = label_double_barrier(df, up_mult=1.5, dn_mult=1.5, max_h=24)
+   ```
+5. **Choose candidate models** (e.g., sklearn pipelines, XGBoost, etc.).
+   The notebook can evaluate multiple candidates and pick the **best per symbol** via time-series CV.
+
+   ```python
+   CANDIDATE_MODELS = {
+       "logreg": make_logreg_pipeline(),
+       "rf":     make_random_forest_pipeline(),
+       "xgb":    make_xgboost_pipeline(),
+       # add your own
+   }
+   ```
+6. **Tune with Optuna (optional)** per symbol/algorithm to refine hyperparameters.
+
+   ```python
+   # example sketch in the notebook
+   study = optuna.create_study(direction="maximize")
+   study.optimize(objective, n_trials=50, timeout=1800)
+   ```
+7. **Backtest** (VectorBT) with your trained predictions to verify edge.
+8. **Save the best pipeline** per symbol & timeframe.
+   The notebook will persist models as:
+
+   ```
+   models/<tf>_models/<SYMBOL>_<TF>_best_model.pkl
+   # e.g. models/h1_models/EURUSD_H1_best_model.pkl
+   ```
+
+   Each `.pkl` typically contains:
+
+   * the fitted pipeline (or model + scaler for legacy),
+   * the selected feature column list.
+
+### Going live with trained models
+
+1. Make sure the saved files exist under `models/<tf>_models/` for **all symbols** you plan to trade.
+2. Update your `.env`:
+
+   ```env
+   TF=H1
+   SYMBOLS=EURUSD,GBPUSD,AUDUSD
+   ```
+
+   (Use the **same `TF`** you used in the notebook.)
+3. Start the live trader (Docker or local). The app will:
+
+   * load `{SYMBOL}_{TF}_best_model.pkl`,
+   * recompute your **feature set** using `feature_engineering.py`,
+   * generate signals each new bar,
+   * apply the **News Gate** (per symbol),
+   * place trades and **journal to Notion** (if enabled),
+   * audit predictions to **SQLite**.
+
+### Tips & gotchas
+
+* **Consistency is king:** use the **same TF** and **feature set** at train and live time.
+* **Feature drift:** if you add/remove indicators later, re-train and re-save your models so live and train match.
+* **Per-symbol training:** each symbol gets its **own** `.pkl`. You can mix different algorithms across symbols.
+* **Thresholding / label params:** small changes to Double-Barrier multipliers or max holding affect trades a lot—validate via backtest.
+* **Speed:** reduce `N_BARS` while prototyping; increase for final training.
+* **Reproducibility:** set seeds in your notebook when comparing models.
+
+Once your models are saved and `.env` is aligned, you’re ready to go live.
+
+
+
+
 ## ⚙️ Configuration (Env Vars)
 
 | Variable                     | Description                                         |
