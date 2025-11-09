@@ -188,9 +188,10 @@ def add_core_features(df: pd.DataFrame) -> pd.DataFrame:
     return out.dropna()
 
 def get_core_feature_cols() -> list[str]:
-    return [
+    base = [
         "sma_20","ema_20","kama_10","rsi_14","macd_diff",
         "atr_14","obv","rolling_std_20","spread","fill","amplitude",
         "autocorr_1","autocorr_5","autocorr_10","market_regime","stationary_flag",
-        "hour_sin","hour_cos","sess_Asia","sess_London","sess_NewYork","sess_PostNY",
     ]
+    sess = ["hour_sin","hour_cos","sess_Asia","sess_London","sess_NewYork","sess_PostNY"]
+    return base + sess

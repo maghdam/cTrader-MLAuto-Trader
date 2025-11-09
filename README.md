@@ -239,6 +239,41 @@ This notebook lets you:
 4. **Pick a labeling strategy** in `src/labeling_schemes.py`.
    Default is **Double-Barrier** (0=down, 1=flat, 2=up). You can tweak barrier sizes/holding periods or add brand-new strategies and select them in the notebook.
 
+---
+
+## Optional: Regime/Momentum Gate
+
+You can gate live entries by a simple regime signal from the feature set (e.g., `market_regime` or `kama_trend`).
+See `docs/REGIME_GATE.md` for details and environment flags:
+
+```
+GATE_BY_REGIME=1
+GATE_SOURCE=market_regime   # or kama_trend
+GATE_STRICT=1               # 1: >0/<0; 0: >=0/<=0
+```
+
+---
+
+## Resilience Settings (Reconnect & Retries)
+
+Tune reconnects and request retries for robust unattended runs:
+
+```
+# Reconnect behavior on TCP disconnects
+RECONNECT_ENABLED=1
+RECONNECT_BASE_SEC=5
+RECONNECT_MAX_SEC=60
+RECONNECT_JITTER_SEC=1.5
+
+# Request retries (e.g., trendbars fetch)
+REQ_RETRY_ATTEMPTS=3
+REQ_RETRY_BACKOFF=0.75   # seconds; exponential per attempt
+
+# Log rotation (live_trader)
+LOG_MAX_BYTES=5242880    # 5 MB
+LOG_BACKUP_COUNT=3
+```
+
    ```python
    # in the notebook
    from labeling_schemes import label_double_barrier  # or your custom

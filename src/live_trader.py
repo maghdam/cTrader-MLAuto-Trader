@@ -10,8 +10,10 @@ import numpy as np
 import pandas as pd
 import joblib
 from dotenv import load_dotenv
+from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 from news_guard import news_gate  
+from control_store import load_map as ctrl_load, get_bool as ctrl_bool, get_int as ctrl_int, get_list as ctrl_list
 warnings.filterwarnings("ignore")
 from datetime import time as dtime  
 from feature_engineering import add_core_features
@@ -62,7 +64,7 @@ LOGGER.propagate = False  # don't bubble to root logger
 
 fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", "%Y-%m-%d %H:%M:%S")
 
-fh = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
+fh = RotatingFileHandler(str(LOG_FILE), maxBytes=int(os.getenv("LOG_MAX_BYTES","5242880")), backupCount=int(os.getenv("LOG_BACKUP_COUNT","3")), encoding="utf-8")
 fh.setFormatter(fmt)
 LOGGER.addHandler(fh)
 
@@ -149,6 +151,11 @@ SLEEP_SEC = _env_int("SLEEP_SEC", 60)
 CLOSE_ON_FLAT    = _env_bool("CLOSE_ON_FLAT", True)
 ALLOW_PYRAMIDING = _env_bool("ALLOW_PYRAMIDING", False)
 MAX_POS_PER_SIDE = _env_int("MAX_POS_PER_SIDE", 1)
+
+# Optional regime/momentum gating
+GATE_BY_REGIME = _env_bool("GATE_BY_REGIME", False)
+GATE_SOURCE     = os.getenv("GATE_SOURCE", "market_regime").strip()
+GATE_STRICT     = _env_bool("GATE_STRICT", True)  # True: >0 for longs, <0 for shorts; False: >=0 / <=0
 
 # Sizing
 DEFAULT_LOTS = _env_float("DEFAULT_LOTS", 0.10)
@@ -486,8 +493,78 @@ class LiveTrader:
 
         self._place_market("SELL")
 
+    # ---- Optional regime/momentum gate ----
+    def _latest_regime_value(self) -> float | None:
+        try:
+            df = get_ohlc_df(self.symbol, tf=TF, n=N_BARS)
+            if df.empty:
+                return None
+            df_feat = add_core_features(df.copy()).dropna()
+            if df_feat.empty:
+                return None
+            val = df_feat.iloc[-1].get(GATE_SOURCE)
+            try:
+                return float(val)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
     def step(self):
         """One loop step: only act once per new bar."""
+        # Dashboard control: pause + runtime overrides (news/regime)
+        try:
+            ctrl = ctrl_load()
+            if ctrl_bool(ctrl, "PAUSE_TRADING", False):
+                log(f"[CTRL] {self.symbol}: paused via dashboard control.")
+                return
+            # Live overrides (safe to tweak)
+            global NEWS_ENABLED, NEWS_LOOKAHEAD_MIN, NEWS_BLOCK_IMPACTS, NEWS_SKIP_IF_UPCOMING
+            global GATE_BY_REGIME, GATE_SOURCE, GATE_STRICT
+            global TF, TF_DELTA, MODEL_FOLDER
+            NEWS_ENABLED = ctrl_bool(ctrl, "NEWS_ENABLED", NEWS_ENABLED)
+            NEWS_LOOKAHEAD_MIN = ctrl_int(ctrl, "NEWS_LOOKAHEAD_MIN", NEWS_LOOKAHEAD_MIN)
+            NEWS_BLOCK_IMPACTS = [s.strip().lower() for s in ctrl_list(ctrl, "NEWS_BLOCK_IMPACTS", NEWS_BLOCK_IMPACTS)]
+            NEWS_SKIP_IF_UPCOMING = ctrl_bool(ctrl, "NEWS_SKIP_IF_UPCOMING", NEWS_SKIP_IF_UPCOMING)
+            GATE_BY_REGIME = ctrl_bool(ctrl, "GATE_BY_REGIME", GATE_BY_REGIME)
+            src = ctrl.get("GATE_SOURCE")
+            if src:
+                GATE_SOURCE = str(src).strip()
+            GATE_STRICT = ctrl_bool(ctrl, "GATE_STRICT", GATE_STRICT)
+
+            # Optional: timeframe/symbol control from dashboard
+            new_tf = (ctrl.get("TF") or "").strip().upper()
+            if new_tf in {"M1","M5","M15","M30","H1","H4","D1"} and new_tf != TF:
+                TF = new_tf
+                TF_DELTA = {
+                    "M1":  pd.Timedelta(minutes=1),
+                    "M5":  pd.Timedelta(minutes=5),
+                    "M15": pd.Timedelta(minutes=15),
+                    "M30": pd.Timedelta(minutes=30),
+                    "H1":  pd.Timedelta(hours=1),
+                    "H4":  pd.Timedelta(hours=4),
+                    "D1":  pd.Timedelta(days=1),
+                }.get(TF, pd.Timedelta(hours=1))
+                MODEL_FOLDER = Path(f"models/{TF.lower()}_models")
+                log(f"[CTRL] {self.symbol}: TF switched to {TF}")
+                # Attempt model hot-reload for new TF
+                try:
+                    desired = MODEL_FOLDER / f"{self.symbol}_{TF}_best_model.pkl"
+                    if desired.exists() and desired != self.model_path:
+                        self.model_path = desired
+                        self.load()
+                        log(f"[CTRL] {self.symbol}: model reloaded for TF={TF}")
+                except Exception as ex:
+                    log(f"[CTRL] {self.symbol}: model reload failed for TF={TF}: {ex}")
+
+            desired_list_raw = (ctrl.get("SYMBOLS") or "").strip()
+            if desired_list_raw:
+                wants = [s.strip().upper() for s in desired_list_raw.replace(";", ",").split(",") if s.strip()]
+                if wants and (self.symbol.upper() not in wants):
+                    # Respect selection: do not trade this symbol on this cycle
+                    return
+        except Exception:
+            pass
         preds, close = self.predict_multi(n_forward=N_FORWARD)
         last_ts = most_recent_bar_time(close.to_frame())  # UTC Timestamp
         if last_ts is None:
@@ -559,6 +636,26 @@ class LiveTrader:
 
         # --- place order if not blocked ---
         sig = int(preds[0])  # {-1,0,+1}
+
+        # Optional regime/momentum gating (before executing non-flat signals)
+        if sig != 0 and GATE_BY_REGIME:
+            rv = self._latest_regime_value()
+            allowed = True
+            if rv is not None:
+                if sig > 0:
+                    allowed = (rv > 0) if GATE_STRICT else (rv >= 0)
+                elif sig < 0:
+                    allowed = (rv < 0) if GATE_STRICT else (rv <= 0)
+            if not allowed:
+                note = f"sig={sig} {GATE_SOURCE}={rv} strict={GATE_STRICT}"
+                log(f"[REGIME BLOCK] {self.symbol}: {note}")
+                if self.journal:
+                    try:
+                        self.journal.log_trade(TradeEvent(event="REGIME_BLOCK", symbol=self.symbol, note=note))
+                    except Exception:
+                        pass
+                return
+
         self._ensure_direction(sig)
 
 
@@ -651,9 +748,15 @@ if __name__ == "__main__":
     for sym in SYMBOLS:
         lots = LOTS.get(sym.upper(), DEFAULT_LOTS)
         model_path = MODEL_FOLDER / f"{sym.upper()}_{TF}_best_model.pkl"
+        if not model_path.exists():
+            log(f"[BOOT] skipping {sym}: missing model at {model_path}")
+            continue
         t = LiveTrader(sym, lots, model_path, journal=journal)
-        t.load()
-        traders[sym] = t
+        try:
+            t.load()
+            traders[sym] = t
+        except Exception as e:
+            log(f"[BOOT] failed to load {sym}: {e}")
 
     log("▶️  Live loop started.")
     try:

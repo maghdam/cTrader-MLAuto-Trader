@@ -20,7 +20,8 @@ services:
       - ./models/h1_models:/app/models/h1_models:ro
       - ./logs:/app/logs
       - ./live_signals.db:/app/live_signals.db   # ensure file exists: `touch live_signals.db`
-      - ./src:/app/src
+      # Use image-bundled source to avoid Windows bind-mount issues.
+      # For live editing, add an override that mounts ./src to /app/src.
 
     working_dir: /app
     entrypoint: ["python", "-u", "src/live_trader.py"]
@@ -52,7 +53,27 @@ services:
     volumes:
       - ./models/h1_models:/app/models/h1_models
       - ./logs:/app/logs
-      - ./src:/app/src
+      # For dev-only live editing, mount ./src to /app/src via an override.
 
     working_dir: /app
     entrypoint: ["python", "-u", "src/optimize_models.py"]
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ml-dbarrier:latest
+    container_name: dbarrier-dashboard
+    restart: unless-stopped
+    init: true
+    env_file: [.env]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"
+    volumes:
+      - ./live_signals.db:/app/live_signals.db
+      - ./logs:/app/logs
+    working_dir: /app
+    entrypoint: ["streamlit", "run", "src/dashboard.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    ports:
+      - "8501:8501"

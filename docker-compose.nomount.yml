@@ -1,0 +1,13 @@
+services:
+  trader:
+    volumes:
+      - ./models/h1_models:/app/models/h1_models:ro
+      - ./logs:/app/logs
+      - ./live_signals.db:/app/live_signals.db
+      # Force using image code at /app/src (no host bind)
+      - /app/src
+  optimize:
+    volumes:
+      - ./models/h1_models:/app/models/h1_models
+      - ./logs:/app/logs
+      - /app/src

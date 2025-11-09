@@ -22,7 +22,7 @@ from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
 
 from twisted.internet import reactor
 from datetime import datetime, timezone, timedelta
-import calendar, time, threading, os
+import calendar, time, threading, os, random, logging
 from dotenv import load_dotenv
 import numpy as np
 import pandas as pd  # for the df helpers
@@ -58,6 +58,17 @@ print("[BOOT] client_id_head =", (CLIENT_ID or "")[:8])
 
 host = EndPoints.PROTOBUF_LIVE_HOST if HOST_TYPE == "live" else EndPoints.PROTOBUF_DEMO_HOST
 client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
+
+# Reconnect / retry config
+RECONNECT_ENABLED   = (os.getenv("RECONNECT_ENABLED", "1").strip().lower() in {"1","true","yes","on"})
+RECONNECT_BASE_SEC  = int(os.getenv("RECONNECT_BASE_SEC", "5"))
+RECONNECT_MAX_SEC   = int(os.getenv("RECONNECT_MAX_SEC", "60"))
+RECONNECT_JITTER    = float(os.getenv("RECONNECT_JITTER_SEC", "1.5"))
+
+REQ_RETRY_ATTEMPTS  = int(os.getenv("REQ_RETRY_ATTEMPTS", "3"))
+REQ_RETRY_BACKOFF   = float(os.getenv("REQ_RETRY_BACKOFF", "0.75"))
+
+LOG = logging.getLogger("ctrader_client")
 
 # ───────────────────────────────────────────────────────────────────────────
 # Symbol Maps & Ready Flags
@@ -188,6 +199,7 @@ def _request_symbols(retry: bool = False):
         ctidTraderAccountId=ACCOUNT_ID,
         includeArchivedSymbols=True  # safer across brokers
     )
+    ensure_client_ready(timeout=20)
     client.send(req).addCallbacks(symbols_response_cb, on_error)
 
 def _list_accounts_cb(res):
@@ -239,11 +251,35 @@ def app_auth_cb(_):
 def connected(_):
     req = ProtoOAApplicationAuthReq(clientId=CLIENT_ID, clientSecret=CLIENT_SECRET)
     client.send(req).addCallbacks(app_auth_cb, on_error)
+    # reset reconnect attempts on successful connect
+    globals().setdefault("_reconnect_attempt", 0)
+    _reconnect_attempt = 0
+
+def _client_ready() -> bool:
+    try:
+        return client is not None and reactor.running
+    except Exception:
+        return False
 
 def init_client():
     symbols_ready.clear()
     client.setConnectedCallback(connected)
-    client.setDisconnectedCallback(lambda c, r: print("[INFO] Disconnected:", r))
+    def _on_disc(c, reason):
+        print("[INFO] Disconnected:", reason)
+        LOG.info("Disconnected: %s", reason)
+        if not RECONNECT_ENABLED:
+            return
+        # exponential backoff with jitter
+        globals().setdefault("_reconnect_attempt", 0)
+        delay = min(RECONNECT_BASE_SEC * (2 ** _reconnect_attempt), RECONNECT_MAX_SEC)
+        delay = delay + random.random() * RECONNECT_JITTER
+        _reconnect_attempt += 1
+        try:
+            reactor.callLater(delay, lambda: (client.startService()))
+        except Exception as ex:
+            print("[WARN] schedule reconnect failed:", ex)
+            LOG.warning("schedule reconnect failed: %s", ex)
+    client.setDisconnectedCallback(_on_disc)
     client.setMessageReceivedCallback(lambda c, m: None)
     client.startService()
     reactor.run(installSignalHandlers=False)
@@ -266,6 +302,22 @@ def wait_until_symbols_loaded(timeout: int = 20) -> None:
 def ensure_client_ready(timeout: int = 20):
     start_background()
     wait_until_symbols_loaded(timeout)
+
+def _ensure_and_send(req, *, client_arg=None, timeout: int | None = None):
+    """Ensure client is ready and send a request (one retry on AttributeError)."""
+    ensure_client_ready(timeout=20)
+    c = client_arg or client
+    try:
+        if timeout is None:
+            return c.send(req)
+        return c.send(req, timeout=timeout)
+    except AttributeError:
+        time.sleep(1.0)
+        ensure_client_ready(timeout=20)
+        c = client_arg or client
+        if timeout is None:
+            return c.send(req)
+        return c.send(req, timeout=timeout)
 
 # ───────────────────────────────────────────────────────────────────────────
 # OHLC Fetchers
@@ -320,9 +372,19 @@ def get_ohlc_data(symbol: str, tf: str = "D1", n: int = 10):
         fromTimestamp       = int(calendar.timegm((now - timedelta(weeks=52)).utctimetuple())) * 1000,
         toTimestamp         = int(calendar.timegm(now.utctimetuple())) * 1000,
     )
-    client.send(req).addCallbacks(_cb, on_error)
-    if not evt.wait(10):
-        raise TimeoutError("Trendbars request timed out")
+    # Simple retry loop on timeout
+    attempts = 0
+    while True:
+        evt.clear(); rows.clear()
+        ensure_client_ready(timeout=20)
+        client.send(req).addCallbacks(_cb, on_error)
+        if evt.wait(10):
+            break
+        attempts += 1
+        if attempts >= max(1, REQ_RETRY_ATTEMPTS):
+            raise TimeoutError("Trendbars request timed out")
+        backoff = REQ_RETRY_BACKOFF * (2 ** (attempts - 1))
+        time.sleep(backoff)
 
     candles = rows[-n:] if n else rows
     highs   = [c["high"]  for c in candles]
@@ -449,7 +511,7 @@ def place_order(
         if take_profit is not None: req.relativeTakeProfit = pips_to_relative_by_symbol(symbol_id, int(take_profit))
 
     print(f"[DEBUG] Sending order: order_type='{order_type}' side='{side}' price={price} SL={stop_loss} TP={take_profit}")
-    d = client.send(req, client_msg_id=client_msg_id, timeout=30)
+    d = _ensure_and_send(req, client_arg=client, timeout=30)
 
     # Optional delayed SL/TP patch after MARKET fill (convert pips → absolute)
     if order_type.upper() == "MARKET" and (stop_loss is not None or take_profit is not None):
@@ -501,7 +563,7 @@ def close_position(*, client, account_id, position_id, volume_units: int | None 
     if volume_units is not None:
         req.volume = int(volume_units)
 
-    return client.send(req, client_msg_id=client_msg_id, timeout=30)
+    return _ensure_and_send(req, client_arg=client, timeout=30)
 
 
 
@@ -509,7 +571,7 @@ def modify_position_sltp(client, account_id, position_id, stop_loss=None, take_p
     req = ProtoOAAmendPositionSLTPReq(ctidTraderAccountId = account_id, positionId = position_id)
     if stop_loss   is not None: req.stopLoss   = float(stop_loss)
     if take_profit is not None: req.takeProfit = float(take_profit)
-    return client.send(req)
+    return _ensure_and_send(req, client_arg=client)
 
 def modify_pending_order_sltp(client, account_id, order_id, version, stop_loss=None, take_profit=None):
     req = ProtoOAAmendOrderReq(
@@ -519,7 +581,7 @@ def modify_pending_order_sltp(client, account_id, order_id, version, stop_loss=N
     )
     if stop_loss   is not None: req.stopLoss   = float(stop_loss)
     if take_profit is not None: req.takeProfit = float(take_profit)
-    return client.send(req)
+    return _ensure_and_send(req, client_arg=client)
 
 # ───────────────────────────────────────────────────────────────────────────
 # Deferred Wait Helper (blocking)

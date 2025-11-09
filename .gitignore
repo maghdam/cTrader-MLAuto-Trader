@@ -5,7 +5,8 @@ __pycache__/
 
 # Env / secrets
 .env
-notes.txt
+
+
 # Data & runtime artifacts
 logs/
 live_signals.db
@@ -16,3 +17,7 @@ models/**/*
 
 # Docker cruft
 *.log
+
+
+# Developer notes
+NOTES.md

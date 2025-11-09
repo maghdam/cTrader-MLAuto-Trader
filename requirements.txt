@@ -20,3 +20,6 @@ notion-client==2.2.1
 pyOpenSSL>=23
 service-identity>=21.1.0
 requests>=2.31   # needed for news_guard
+streamlit>=1.28.0
+streamlit-autorefresh>=1.0.1
+watchfiles==0.21.0  # for optional DEV_RELOAD in entrypoint

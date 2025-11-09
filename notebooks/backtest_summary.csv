@@ -1,0 +1,6 @@
+Symbol,Model,Accuracy,Return(%),Sharpe,MaxDD(%)
+GBPUSD,GradientBoostingClassifier,0.609,-0.14,-0.008,-5.57
+US500,RandomForestClassifier,0.794,-5.01,-1.14,-8.5
+EURGBP,GradientBoostingClassifier,0.945,-1.57,-1.335,-2.09
+US30,SVC,0.824,-3.25,-2.554,-3.49
+EURUSD,GaussianNB,0.788,-13.07,-4.057,-13.32
